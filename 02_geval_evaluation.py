@@ -1,61 +1,55 @@
 """
-ΣΤΑΔΙΟ 2: G-Eval (LLM-as-a-Judge) αξιολόγηση με ΔΩΡΕΑΝ open-source μοντέλα
-(μέσω Hugging Face Inference Providers)
+ΣΤΑΔΙΟ 2: G-Eval (LLM-as-a-Judge) αξιολόγηση με το ταχύτατο Groq API (ΔΩΡΕΑΝ Tier)
 -----------------------------------------------------------------------
 Διαβάζει το CSV που παράγει το 01_calculate_consistency.py (στήλες
 question, mean_consistency, sample_strategy, sample_indices, 1..10) και
-στέλνει τις αντιπροσωπευτικές απαντήσεις κάθε ερώτησης σε ένα δωρεάν,
-open-source instruct μοντέλο, για 3 κριτήρια: Accuracy, Readability,
-Completeness.
+στέλνει τις αντιπροσωπευτικές απαντήσεις κάθε ερώτησης για 3 κριτήρια:
+Accuracy, Readability, Completeness.
 
 Αλλαγές σε σχέση με την πρώτη έκδοση:
-  1. ΣΗΜΑΝΤΙΚΟ: Το "meta-llama/Meta-Llama-3-8B-Instruct" είναι "gated"
-     μοντέλο — η Meta απαιτεί χειροκίνητη αποδοχή license στη σελίδα του
-     μοντέλου στο HF πριν το token σου μπορεί να το καλέσει (αλλιώς 403).
-     Εδώ, αν το πρωτεύον μοντέλο αποτύχει, δοκιμάζονται αυτόματα ungated,
-     αξιόπιστα διαθέσιμα εναλλακτικά μοντέλα (fallback list).
-  2. Preflight έλεγχος: μία δοκιμαστική κλήση πριν ξεκινήσει όλο το loop,
-     ώστε να μάθεις αμέσως αν υπάρχει πρόβλημα (λάθος token, gated μοντέλο,
-     μη διαθέσιμο provider) αντί να το ανακαλύψεις μετά από 138 κλήσεις.
-  3. Σαφής διάγνωση σφαλμάτων: ξεχωρίζει 403 (gated/permissions), 404
-     (μοντέλο μη διαθέσιμο σε κανέναν inference provider αυτή τη στιγμή),
-     429 (πραγματικό rate limit -> αυτό ΜΟΝΟ κάνει retry).
-  4. Συμβατό 100% με τη δομή εξόδου του 01_calculate_consistency.py.
+  1. ΚΡΙΣΙΜΟ: Το "llama3-70b-8192" είναι ΑΠΟΣΥΡΜΕΝΟ (decommissioned) από
+     το Groq -> κάθε κλήση θα απέτυχε με 400 error. Αντικαταστάθηκε με
+     "openai/gpt-oss-120b", το μοντέλο που προτείνει επίσημα το Groq ως
+     διάδοχο για general-purpose/reasoning tasks, με fallback λίστα.
+  2. Preflight έλεγχος: μικρή δοκιμαστική κλήση πριν ξεκινήσει όλο το
+     loop, ώστε να μάθεις αμέσως αν κάτι δεν δουλεύει (λάθος key, μοντέλο
+     αποσυρμένο) αντί να το ανακαλύψεις μετά από αρκετές ερωτήσεις.
+  3. Σωστός διαχωρισμός σφαλμάτων: 401 (λάθος API key) και 400 (π.χ.
+     αποσυρμένο μοντέλο) ΔΕΝ κάνουν retry — δεν θα διορθωθούν ποτέ έτσι.
+     Μόνο πραγματικό 429 (rate limit) κάνει retry με backoff.
+  4. Αυτόματο fallback σε επόμενο μοντέλο αν το πρωτεύον αποτύχει στο
+     preflight έλεγχο.
 """
 
 import csv
 import os
-import re
 import sys
+import re
 import time
 
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import HfHubHTTPError
+from openai import OpenAI, APIStatusError, AuthenticationError, RateLimitError
 
 # --- ΡΥΘΜΙΣΕΙΣ ---
 INPUT_CSV = "chatbot_results_with_consistency.csv"
 OUTPUT_CSV = "geval_results.csv"
 
-# Πρωτεύον μοντέλο + ungated εναλλακτικά (με τη σειρά που θα δοκιμαστούν)
+# Μοντέλα προς δοκιμή, με τη σειρά (το πρώτο διαθέσιμο θα χρησιμοποιηθεί).
+# openai/gpt-oss-120b: επίσημα προτεινόμενο από το Groq ως state-of-the-art
+# reasoning μοντέλο (Οκτώβριος 2025+), αντικαθιστά τα παλιά llama3-70b/llama-3.3-70b.
 CANDIDATE_MODELS = [
-    "HuggingFaceH4/zephyr-7b-beta",             # ungated, δημοφιλές fine-tune του Mistral
-    "mistralai/Mistral-7B-Instruct-v0.3",        # ungated fallback #1
-    "Qwen/Qwen2.5-7B-Instruct",                   # ungated fallback #2
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
 ]
 
-MAX_RETRIES = 4
-REQUEST_DELAY_SECONDS = 1.0  # ευγενική καθυστέρηση για το δωρεάν rate limit
+MAX_RETRIES = 5
+REQUEST_DELAY_SECONDS = 0.4  # μικρή καθυστέρηση, σεβασμός στα TPM limits
 
 csv.field_size_limit(100_000_000)
 
-# ΣΗΜΕΙΩΣΗ: το header x-use-cache:false απενεργοποιεί μόνο το caching
-# πανομοιότυπων prompts (χρήσιμο ώστε κάθε ερώτηση να παίρνει "φρέσκια"
-# generation) — ΔΕΝ επηρεάζει τη χρέωση/routing μέσω Inference Providers.
-# Αν έχεις εξαντλήσει τα μηνιαία δωρεάν credits, θα πάρεις 402 ό,τι header
-# κι αν βάλεις — δες τις σημειώσεις στο τέλος του αρχείου για πραγματικές λύσεις.
-client = InferenceClient(
-    api_key=os.environ.get("HF_TOKEN"),
-    headers={"x-use-cache": "false"},
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.environ.get("GROQ_API_KEY"),
 )
 
 CRITERIA = {
@@ -105,34 +99,22 @@ Rating: <integer 1-5>"""
 
 
 def pick_working_model():
-    """
-    Δοκιμάζει τα CANDIDATE_MODELS με τη σειρά, με μία μικρή δοκιμαστική
-    κλήση το καθένα, και επιστρέφει το πρώτο που δουλεύει.
-    Αυτό αποφεύγει να ανακαλύψεις μετά από 100+ κλήσεις ότι το μοντέλο
-    που διάλεξες είναι gated ή δεν φιλοξενείται πια από κανέναν provider.
-    """
+    """Δοκιμάζει τα CANDIDATE_MODELS με τη σειρά και επιστρέφει το πρώτο που δουλεύει."""
     for model_name in CANDIDATE_MODELS:
         print(f"[INFO] Δοκιμή μοντέλου: {model_name} ...")
         try:
-            client.chat_completion(
+            client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": "Reply with only the word OK."}],
                 max_tokens=5,
             )
             print(f"[INFO] Επιτυχία! Χρησιμοποιείται το: {model_name}")
             return model_name
-        except HfHubHTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 402:
-                print(f"    [SKIP] '{model_name}' -> 402 Payment Required: εξαντλήθηκαν τα μηνιαία δωρεάν "
-                      f"credits του HF account σου για Inference Providers (ισχύει ανεξαρτήτως μοντέλου).")
-            elif status == 403:
-                print(f"    [SKIP] '{model_name}' είναι gated ή χωρίς άδεια πρόσβασης (403). "
-                      f"Αν θέλεις αυτό το μοντέλο, ζήτησε πρόσβαση στη σελίδα του στο HF.")
-            elif status == 404:
-                print(f"    [SKIP] '{model_name}' δεν είναι διαθέσιμο σε κανέναν inference provider αυτή τη στιγμή (404).")
-            else:
-                print(f"    [SKIP] '{model_name}' απέτυχε (HTTP {status}): {e}")
+        except AuthenticationError as e:
+            print(f"[FATAL] Λάθος GROQ_API_KEY ({e}). Έλεγξε το key σου στο https://console.groq.com/keys")
+            return None
+        except APIStatusError as e:
+            print(f"    [SKIP] '{model_name}' απέτυχε (HTTP {e.status_code}): {e.message}")
         except Exception as e:
             print(f"    [SKIP] '{model_name}' απέτυχε: {e}")
     return None
@@ -143,11 +125,10 @@ def call_geval(model_name, question, chatbot_answer, criterion_name, rubric):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = client.chat_completion(
+            response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.1,
+                temperature=0.0,  # Μέγιστη σταθερότητα στην κρίση
             )
             content = response.choices[0].message.content.strip()
 
@@ -160,24 +141,18 @@ def call_geval(model_name, question, chatbot_answer, criterion_name, rubric):
 
             return justification, rating
 
-        except HfHubHTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 402:
-                print(f"    [FATAL] 402 Payment Required: εξαντλήθηκαν τα μηνιαία δωρεάν credits "
-                      f"του HF account σου. Retry δεν θα βοηθήσει — δες τις λύσεις στο τέλος του αρχείου.")
-                return None, None
-            elif status == 429:
-                # πραγματικό rate limit -> αξίζει retry
-                wait = 5 * attempt
-                print(f"    [WARN] Rate limit (429), retry σε {wait}s (προσπάθεια {attempt}/{MAX_RETRIES})...")
-                time.sleep(wait)
-            else:
-                # π.χ. 403/404/500 -> δεν θα διορθωθεί με retry, σταματάμε αμέσως
-                print(f"    [ERROR] Μη ανακτήσιμο σφάλμα (HTTP {status}): {e}")
-                return None, None
+        except RateLimitError as e:
+            # Πραγματικό rate limit -> αξίζει retry με exponential backoff
+            wait = 3 * attempt
+            print(f"    [WARN] Rate limit ({e}), retry σε {wait}s (προσπάθεια {attempt}/{MAX_RETRIES})...")
+            time.sleep(wait)
+        except APIStatusError as e:
+            # π.χ. 400 (μοντέλο/παράμετροι), 401, 404 -> δεν διορθώνεται με retry
+            print(f"    [ERROR] Μη ανακτήσιμο σφάλμα (HTTP {e.status_code}): {e.message}")
+            return None, None
         except Exception as e:
-            wait = 5 * attempt
-            print(f"    [WARN] Σφάλμα σύνδεσης ({e}), retry σε {wait}s (προσπάθεια {attempt}/{MAX_RETRIES})...")
+            wait = 3 * attempt
+            print(f"    [WARN] Σφάλμα σύνδεσης στο Groq ({e}), retry σε {wait}s...")
             time.sleep(wait)
 
     print("    [ERROR] Απέτυχαν όλες οι προσπάθειες — παραλείπεται.")
@@ -185,17 +160,17 @@ def call_geval(model_name, question, chatbot_answer, criterion_name, rubric):
 
 
 def main():
-    if not os.environ.get("HF_TOKEN"):
-        print("[ERROR] Δεν βρέθηκε το environment variable HF_TOKEN.")
-        print("        cmd.exe:      set HF_TOKEN=hf_...")
-        print("        PowerShell:   $env:HF_TOKEN=\"hf_...\"")
+    if not os.environ.get("GROQ_API_KEY"):
+        print("[ERROR] Δεν βρέθηκε το environment variable GROQ_API_KEY.")
+        print("        cmd.exe:      set GROQ_API_KEY=gsk_...")
+        print("        PowerShell:   $env:GROQ_API_KEY=\"gsk_...\"")
         return
 
-    print("[INFO] Έλεγχος διαθέσιμων μοντέλων...")
+    print("[INFO] Έλεγχος διαθέσιμων μοντέλων στο Groq...")
     model_name = pick_working_model()
     if model_name is None:
-        print("[FATAL] Κανένα από τα υποψήφια μοντέλα δεν είναι διαθέσιμο αυτή τη στιγμή.")
-        print("        Έλεγξε το HF_TOKEN σου ή πρόσθεσε άλλα μοντέλα στη λίστα CANDIDATE_MODELS.")
+        print("[FATAL] Κανένα μοντέλο δεν είναι διαθέσιμο αυτή τη στιγμή. "
+              "Έλεγξε https://console.groq.com/docs/models για ενημερωμένη λίστα.")
         return
 
     try:
@@ -203,18 +178,19 @@ def main():
             reader = csv.DictReader(f)
             rows = list(reader)
     except FileNotFoundError:
-        print(f"[ERROR] Δεν βρέθηκε το '{INPUT_CSV}'. Τρέξτε πρώτα το 01_calculate_consistency.py.")
+        print(f"[ERROR] Δεν βρέθηκε το '{INPUT_CSV}'. Τρέξτε πρώτα το Στάδιο 1.")
         return
 
     results = []
     total_calls = 0
 
+    print(f"[INFO] Έναρξη αξιολόγησης μέσω Groq ({model_name}) για {len(rows)} ερωτήσεις...")
     for idx, row in enumerate(rows, 1):
         question = row["question"]
         strategy = row["sample_strategy"]
         indices = [i.strip() for i in row["sample_indices"].split(",") if i.strip()]
 
-        print(f"[{idx}/{len(rows)}] '{question[:50]}...' -> στρατηγική: {strategy} ({len(indices)} απάντηση/εις)")
+        print(f"[{idx}/{len(rows)}] '{question[:40]}...' -> στρατηγική: {strategy} ({len(indices)} απάντηση/εις)")
 
         for ans_idx in indices:
             answer_text = row[ans_idx]
@@ -250,7 +226,7 @@ def main():
         writer.writerows(results)
 
     print("-" * 60)
-    print(f"[SUCCESS] Αποθηκεύτηκε: {OUTPUT_CSV}")
+    print(f"[SUCCESS] Αποθηκεύτηκε με επιτυχία το: {OUTPUT_CSV}")
     print(f"[INFO] Μοντέλο-κριτής: {model_name}")
     print(f"[INFO] Συνολικές κλήσεις API: {total_calls}")
 
